@@ -19,6 +19,7 @@ class FinePreprocess(nn.Module):
         super().__init__()
 
         self.config = config
+        self.fix_output_size = config.get('fix_output_size', False)
         block_dims = config['backbone']['block_dims']
         self.W = self.config['fine_window_size']
         self.fine_d_model = block_dims[0]
@@ -62,15 +63,20 @@ class FinePreprocess(nn.Module):
     def forward(self, feat_c0, feat_c1, data):
         W = self.W
         stride = data['hw0_f'][0] // data['hw0_c'][0]
+        # Explicit int cast for stride to avoid "0-d Tensor" errors in TRT
+        if self.fix_output_size:
+            stride = int(stride.item()) if hasattr(stride, 'item') else int(stride)
 
         data.update({'W': W})
-        if data['b_ids'].shape[0] == 0:
+        # Skip empty check when using fixed output size (M is never 0)
+        if not self.fix_output_size and data['b_ids'].shape[0] == 0:
             feat0 = torch.empty(0, self.W**2, self.fine_d_model, device=feat_c0.device)
             feat1 = torch.empty(0, self.W**2, self.fine_d_model, device=feat_c0.device)
             return feat0, feat1
 
         if data['hw0_i'] == data['hw1_i']:
-            feat_c = rearrange(torch.cat([feat_c0, feat_c1], 0), 'b (h w) c -> b c h w', h=data['hw0_c'][0]) # 1/8 feat
+            h0c = int(data['hw0_c'][0]) if self.fix_output_size else data['hw0_c'][0]
+            feat_c = rearrange(torch.cat([feat_c0, feat_c1], 0), 'b (h w) c -> b c h w', h=h0c) # 1/8 feat
             x2 = data['feats_x2'] # 1/4 feat
             x1 = data['feats_x1'] # 1/2 feat
             del data['feats_x2'], data['feats_x1']
@@ -80,6 +86,8 @@ class FinePreprocess(nn.Module):
             feat_f0, feat_f1 = torch.chunk(x1, 2, dim=0)
 
             # 2. unfold(crop) all local windows
+            # Convert stride to int for ONNX export compatibility
+            stride = int(stride.item()) if torch.is_tensor(stride) else int(stride)
             feat_f0 = F.unfold(feat_f0, kernel_size=(W, W), stride=stride, padding=0)
             feat_f0 = rearrange(feat_f0, 'n (c ww) l -> n l ww c', ww=W**2)
             feat_f1 = F.unfold(feat_f1, kernel_size=(W+2, W+2), stride=stride, padding=1)
@@ -91,7 +99,9 @@ class FinePreprocess(nn.Module):
 
             return feat_f0, feat_f1
         else:  # handle different input shapes
-            feat_c0, feat_c1 = rearrange(feat_c0, 'b (h w) c -> b c h w', h=data['hw0_c'][0]), rearrange(feat_c1, 'b (h w) c -> b c h w', h=data['hw1_c'][0]) # 1/8 feat
+            h0c = int(data['hw0_c'][0]) if self.fix_output_size else data['hw0_c'][0]
+            h1c = int(data['hw1_c'][0]) if self.fix_output_size else data['hw1_c'][0]
+            feat_c0, feat_c1 = rearrange(feat_c0, 'b (h w) c -> b c h w', h=h0c), rearrange(feat_c1, 'b (h w) c -> b c h w', h=h1c) # 1/8 feat
             x2_0, x2_1 = data['feats_x2_0'], data['feats_x2_1'] # 1/4 feat
             x1_0, x1_1 = data['feats_x1_0'], data['feats_x1_1'] # 1/2 feat
             del data['feats_x2_0'], data['feats_x1_0'], data['feats_x2_1'], data['feats_x1_1']
@@ -100,6 +110,8 @@ class FinePreprocess(nn.Module):
             feat_f0, feat_f1 = self.inter_fpn(feat_c0, x2_0, x1_0, stride), self.inter_fpn(feat_c1, x2_1, x1_1, stride)
 
             # 2. unfold(crop) all local windows
+            # Convert stride to int for ONNX export compatibility
+            stride = int(stride.item()) if torch.is_tensor(stride) else int(stride)
             feat_f0 = F.unfold(feat_f0, kernel_size=(W, W), stride=stride, padding=0)
             feat_f0 = rearrange(feat_f0, 'n (c ww) l -> n l ww c', ww=W**2)
             feat_f1 = F.unfold(feat_f1, kernel_size=(W+2, W+2), stride=stride, padding=1)

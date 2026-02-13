@@ -14,6 +14,7 @@ class FineMatching(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.fix_output_size = config.get('fix_output_size', False)
         self.local_regress_temperature = config['match_fine']['local_regress_temperature']
         self.local_regress_slicedim = config['match_fine']['local_regress_slicedim']
         self.fp16 = config['half']
@@ -37,7 +38,8 @@ class FineMatching(nn.Module):
         self.M, self.W, self.WW, self.C, self.scale = M, W, WW, C, scale
 
         # corner case: if no coarse matches found
-        if M == 0:
+        # Skip this check when using fixed output size (M is always B*L > 0)
+        if not self.fix_output_size and M == 0:
             assert self.training == False, "M is always > 0 while training, see coarse_matching.py"
             data.update({
                 'conf_matrix_f': torch.empty(0, WW, WW, device=feat_0.device),
@@ -78,10 +80,13 @@ class FineMatching(nn.Module):
         m_ids = m_ids[...,None,None].expand(-1, 3, 3)
         idx_l = idx_l[...,None,None].expand(-1, 3, 3) # [m, k, 3, 3]
 
-        idx_r_iids = idx_r_iids[...,None,None].expand(-1, 3, 3) + delta[None, ..., 1]
-        idx_r_jids = idx_r_jids[...,None,None].expand(-1, 3, 3) + delta[None, ..., 0]
+        # Fix delta indexing for TensorRT - squeeze unnecessary dimensions
+        delta_i = delta[0, :, :, 1]  # [3, 3]
+        delta_j = delta[0, :, :, 0]  # [3, 3]
+        idx_r_iids = idx_r_iids[...,None,None].expand(-1, 3, 3) + delta_i[None, :, :]
+        idx_r_jids = idx_r_jids[...,None,None].expand(-1, 3, 3) + delta_j[None, :, :]
 
-        if idx_l.numel() == 0:
+        if not self.fix_output_size and idx_l.numel() == 0:
             data.update({
                 'mkpts0_f': data['mkpts0_c'],
                 'mkpts1_f': data['mkpts1_c'],
@@ -113,7 +118,7 @@ class FineMatching(nn.Module):
 
         # mkpts0_f and mkpts1_f
         mkpts0_f = mkpts0_c
-        mkpts1_f = mkpts1_c + (coords_normed * (3 // 2) * scale1)
+        mkpts1_f = mkpts1_c + coords_normed * (3 // 2) * scale1
 
         data.update({
             "mkpts0_f": mkpts0_f,
@@ -149,7 +154,7 @@ class FineMatching(nn.Module):
         else: # scale0 is a float
             mkpts0_f = (data['mkpts0_c'][:,None,:] + (delta_l * scale0)).reshape(-1, 2)
             mkpts1_f = (data['mkpts1_c'][:,None,:] + (delta_r * scale1)).reshape(-1, 2)
-        
+
         data.update({
             "mkpts0_c": mkpts0_f,
             "mkpts1_c": mkpts1_f
