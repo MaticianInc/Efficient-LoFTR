@@ -30,6 +30,7 @@ class LoFTR(nn.Module):
         # Misc
         self.config = config
         self.profiler = profiler
+        # NOTE: Same architecture for fixed output size as in submodule LoFTR
         self.fix_output_size = config.get('fix_output_size', False)
 
         # Modules
