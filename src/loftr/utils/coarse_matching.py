@@ -68,6 +68,7 @@ class CoarseMatching(nn.Module):
         self.temperature = config['dsmax_temperature']
         self.skip_softmax = config['skip_softmax']
         self.fp16matmul = config['fp16matmul']
+        self.fix_output_size = config.get('fix_output_size', False)
         # -- # for trainig fine-level LoFTR
         self.train_coarse_percent = config['train_coarse_percent']
         self.train_pad_num_gt_min = config['train_pad_num_gt_min']
@@ -124,7 +125,10 @@ class CoarseMatching(nn.Module):
         data.update({'conf_matrix': sim_matrix})
 
         # predict coarse matches from conf_matrix
-        data.update(**self.get_coarse_match(sim_matrix, data))
+        if self.fix_output_size:
+            data.update(**self.get_coarse_match_fixed_size(sim_matrix, data))
+        else:
+            data.update(**self.get_coarse_match(sim_matrix, data))
 
     @torch.no_grad()
     def get_coarse_match(self, conf_matrix, data):
@@ -169,7 +173,9 @@ class CoarseMatching(nn.Module):
 
         # 3. find all valid coarse matches
         # this only works when at most one `True` in each row
-        mask_v, all_j_ids = mask.max(dim=2)
+        # Convert to float for TensorRT compatibility (doesn't support ReduceMax on bool)
+        mask_v, all_j_ids = mask.float().max(dim=2)
+        mask_v = mask_v.bool()
         b_ids, i_ids = torch.where(mask_v)
         j_ids = all_j_ids[b_ids, i_ids]
         mconf = conf_matrix[b_ids, i_ids, j_ids]
@@ -236,6 +242,107 @@ class CoarseMatching(nn.Module):
             'mkpts0_c': mkpts0_c[mconf != 0],
             'mkpts1_c': mkpts1_c[mconf != 0],
             'mconf': mconf[mconf != 0]
+        })
+
+        return coarse_matches
+
+    def _apply_border_mask(self, mask, data, axes_lengths, fill_value):
+        """Apply border masking with rearrange."""
+        mask = rearrange(mask, 'b (h0c w0c) (h1c w1c) -> b h0c w0c h1c w1c', **axes_lengths)
+        if 'mask0' not in data:
+            mask_border(mask, self.border_rm, fill_value)
+        else:
+            mask_border_with_padding(mask, self.border_rm, fill_value, data['mask0'], data['mask1'])
+        return rearrange(mask, 'b h0c w0c h1c w1c -> b (h0c w0c) (h1c w1c)', **axes_lengths)
+
+    def _compute_keypoint_coords(self, i_ids, j_ids, b_ids, data):
+        """Compute keypoint coordinates from indices."""
+        scale = data['hw0_i'][0] / data['hw0_c'][0]
+        scale0 = scale * data['scale0'][b_ids] if 'scale0' in data else scale
+        scale1 = scale * data['scale1'][b_ids] if 'scale1' in data else scale
+
+        mkpts0_c = (
+            torch.stack([i_ids % data['hw0_c'][1], i_ids // data['hw0_c'][1]], dim=1).float()
+            * scale0
+        )
+        mkpts1_c = (
+            torch.stack([j_ids % data['hw1_c'][1], j_ids // data['hw1_c'][1]], dim=1).float()
+            * scale1
+        )
+
+        return mkpts0_c, mkpts1_c
+
+    @torch.no_grad()
+    def get_coarse_match_fixed_size(self, conf_matrix, data):
+        """
+        Returns fixed B*L matches for TensorRT compatibility.
+
+        Args:
+            conf_matrix (torch.Tensor): [B, L, S]
+            data (dict): with keys ['hw0_i', 'hw1_i', 'hw0_c', 'hw1_c']
+        Returns:
+            coarse_matches (dict): {
+                'b_ids': [M,],  # M = B * L (fixed size)
+                'i_ids': [M,],
+                'j_ids': [M,],
+                'mkpts0_c': [M, 2],
+                'mkpts1_c': [M, 2],
+                'mconf': [M,]  # Invalid matches have mconf = 0
+            }
+        """
+        # Explicit int casting for TensorRT
+        axes_lengths = {
+            'h0c': int(data['hw0_c'][0]),
+            'w0c': int(data['hw0_c'][1]),
+            'h1c': int(data['hw1_c'][0]),
+            'w1c': int(data['hw1_c'][1]),
+        }
+        _device = conf_matrix.device
+        B, L, _ = conf_matrix.shape
+
+        # 1. Confidence thresholding (use float instead of bool for TRT)
+        mask = (conf_matrix > self.thr).float()
+
+        # 2. Mask border (use 0.0 instead of False for float mask)
+        mask = self._apply_border_mask(mask, data, axes_lengths, 0.0)
+
+        # 3. Mutual nearest neighbor (explicit .float() for TRT)
+        mask = (
+            mask
+            * (conf_matrix == conf_matrix.max(dim=2, keepdim=True)[0]).float()
+            * (conf_matrix == conf_matrix.max(dim=1, keepdim=True)[0]).float()
+        )
+
+        # Instead of mask.nonzero() / torch.where(), generate fixed-size indices.
+        # This ensures M is always B * L.
+        b_idx = torch.arange(B, device=_device).view(B, 1).expand(B, L)
+        i_idx = torch.arange(L, device=_device).view(1, L).expand(B, L)
+
+        # Find the best match 'j' for every 'i', even if invalid
+        mask_v, all_j_ids = mask.max(dim=2)
+
+        # Flatten to [M,] where M = B * L
+        b_ids = b_idx.reshape(-1)
+        i_ids = i_idx.reshape(-1)
+        j_ids = all_j_ids.reshape(-1)
+        mask_v_flat = mask_v.reshape(-1)
+
+        # Select confidence scores
+        mconf = conf_matrix[b_ids, i_ids, j_ids]
+
+        # Zero out invalid matches
+        mconf = mconf * mask_v_flat.float()
+
+        # These matches select patches that feed into fine-level network
+        coarse_matches = {'b_ids': b_ids, 'i_ids': i_ids, 'j_ids': j_ids}
+
+        # 4. Compute coordinates (fixed size - all B*L points)
+        mkpts0_c, mkpts1_c = self._compute_keypoint_coords(i_ids, j_ids, b_ids, data)
+
+        coarse_matches.update({
+            'mkpts0_c': mkpts0_c,
+            'mkpts1_c': mkpts1_c,
+            'mconf': mconf,
         })
 
         return coarse_matches

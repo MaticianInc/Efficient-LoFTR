@@ -30,13 +30,21 @@ class LoFTR(nn.Module):
         # Misc
         self.config = config
         self.profiler = profiler
+        # NOTE: Same architecture for fixed output size as in submodule LoFTR
+        self.fix_output_size = config.get('fix_output_size', False)
 
         # Modules
-        self.backbone = build_backbone(config)            
+        self.backbone = build_backbone(config)
         self.loftr_coarse = LocalFeatureTransformer(config)
-        self.coarse_matching = CoarseMatching(config['match_coarse'])
-        self.fine_preprocess = FinePreprocess(config)
-        self.fine_matching = FineMatching(config)
+        # Propagate fix_output_size to CoarseMatching
+        match_coarse_cfg = dict(config['match_coarse'])
+        match_coarse_cfg['fix_output_size'] = self.fix_output_size
+        self.coarse_matching = CoarseMatching(match_coarse_cfg)
+        # Propagate fix_output_size to FinePreprocess and FineMatching
+        config_with_flag = dict(config)
+        config_with_flag['fix_output_size'] = self.fix_output_size
+        self.fine_preprocess = FinePreprocess(config_with_flag)
+        self.fine_matching = FineMatching(config_with_flag)
 
     def forward(self, data):
         """ 
